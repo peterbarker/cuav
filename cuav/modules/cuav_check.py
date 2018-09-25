@@ -43,11 +43,15 @@ class CUAVModule(mp_module.MPModule):
         self.last_recall_check = 0
         self.is_armed = False
 
+        self.kraken_has_been_recalled = False
+        self.kraken_has_been_released = False
+
         from MAVProxy.modules.lib.mp_settings import MPSettings, MPSetting
         self.cuav_settings = MPSettings(
             [ MPSetting('rpm_threshold', int, 6000, 'RPM Threshold'),
               MPSetting('wind_speed', float, 0, 'wind speed (m/s)'),
               MPSetting('wind_direction', float, 0, 'wind direction (degrees)'),
+              MPSetting('kraken_cancel_windspeed', float, 9.0, 'cancel kraken wind speed (m/s)'),
               MPSetting('button_pin', float, 0, 'button pin'),
               MPSetting('fuel_pin', float, 1, 'fuel pin'),
               MPSetting('wp_center', int, 2, 'center search USER number'),
@@ -347,6 +351,35 @@ class CUAVModule(mp_module.MPModule):
             ret = False
         return ret
 
+    def recall_kraken(self):
+        self.console.writeln('Recalling Kraken', fg='blue')
+        # use all links
+        for i in range(len(self.mpstate.mav_master)):
+            m = self.mpstate.mav_master[i]
+            src_saved = m.mav.srcSystem
+            try:
+                m.mav.srcSystem = 253
+                m.mav.command_long_send(
+                    0,  # target_system
+                    0, # target_component
+                    mavutil.mavlink.MAV_CMD_USER_2, # command
+                    0, # confirmation
+                    42, # param1
+                    0, # param2
+                    0, # param3
+                    0, # param4
+                    0, # param5
+                    0, # param6
+                    0) # param7
+            except Exception as ex:
+                print(ex)
+            m.mav.srcSystem = src_saved
+        map2 = self.module("map2")
+        if map2:
+            map2.map.set_follow(1)
+            map2.map.set_zoom(2000)
+        self.kraken_has_been_recalled = True
+
     def check_recall(self):
         '''check for recalling Kraken'''
         v = self.mav_param.get('Q_ENABLE',None)
@@ -363,32 +396,32 @@ class CUAVModule(mp_module.MPModule):
         except Exception:
             return
         if mc.seq == wp_recall:
-            self.console.writeln('Recalling Kraken', fg='blue')
-            # use all links
-            for i in range(len(self.mpstate.mav_master)):
-                m = self.mpstate.mav_master[i]
-                src_saved = m.mav.srcSystem
-                try:
-                    m.mav.srcSystem = 253
-                    m.mav.command_long_send(
-                        0,  # target_system
-                        0, # target_component
-                        mavutil.mavlink.MAV_CMD_USER_2, # command
-                        0, # confirmation
-                        42, # param1
-                        0, # param2
-                        0, # param3
-                        0, # param4
-                        0, # param5
-                        0, # param6
-                        0) # param7
-                except Exception as ex:
-                    print(ex)
-                m.mav.srcSystem = src_saved
-            map2 = self.module("map2")
-            if map2:
-                map2.map.set_follow(1)
-                map2.map.set_zoom(2000)
+            self.recall_kraken()
+
+    def release_kraken(self):
+        self.console.writeln('Releasing Kraken', fg='blue')
+        # use all links
+        for i in range(len(self.mpstate.mav_master)):
+            m = self.mpstate.mav_master[i]
+            src_saved = m.mav.srcSystem
+            try:
+                m.mav.srcSystem = 253
+                m.mav.command_long_send(
+                    0,  # target_system
+                    0, # target_component
+                    mavutil.mavlink.MAV_CMD_USER_2, # command
+                    0, # confirmation
+                    24, # param1
+                    0, # param2
+                    0, # param3
+                    0, # param4
+                    0, # param5
+                    0, # param6
+                    0) # param7
+            except Exception as ex:
+                print(ex)
+            m.mav.srcSystem = src_saved
+        self.kraken_has_been_released = True
 
     def check_release(self):
         '''check for releasing Kraken'''
@@ -405,30 +438,32 @@ class CUAVModule(mp_module.MPModule):
             mc = self.master.messages['MISSION_CURRENT']
         except Exception:
             return
-        if mc.seq == wp_release:
-            self.console.writeln('Releasing Kraken', fg='blue')
-            # use all links
-            for i in range(len(self.mpstate.mav_master)):
-                m = self.mpstate.mav_master[i]
-                src_saved = m.mav.srcSystem
-                try:
-                    # use 1st link
-                    m.mav.srcSystem = 253
-                    m.mav.command_long_send(
-                        0,  # target_system
-                        0, # target_component
-                        mavutil.mavlink.MAV_CMD_USER_2, # command
-                        0, # confirmation
-                        24, # param1
-                        0, # param2
-                        0, # param3
-                        0, # param4
-                        0, # param5
-                        0, # param6
-                        0) # param7
-                except Exception as ex:
-                    print(ex)
-                m.mav.srcSystem = src_saved
+        if mc.seq != wp_release:
+            return
+
+        if self.kraken_has_been_recalled:
+            return
+
+        # if we have not already released, check wind speed and
+        # consider cancelling instead
+        do_recall = False
+        if not self.kraken_has_been_released:
+            try:
+                mc = self.master.messages['WIND']
+                if (self.cuav_settings.kraken_cancel_windspeed > 0 and
+                    mc.speed >= self.cuav_settings.kraken_cancel_windspeed):
+                    print("Kraken speed BAD (%0.2f m/s < %0.2f m/s)" % (mc.speed, self.cuav_settings.kraken_cancel_windspeed))
+                    do_recall = True
+                else:
+                    print("Kraken speed OK (%0.2f m/s < %0.2f m/s)" % (mc.speed, self.cuav_settings.kraken_cancel_windspeed))
+            except Exception:
+                pass
+
+        if do_recall or self.kraken_has_been_recalled:
+            self.recall_kraken()
+        else:
+            self.release_kraken()
+
 
     def check_QNH(self):
         '''check QNH settings'''
